@@ -1,0 +1,65 @@
+name: DSH Runtime Smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  dsh-web-smoke:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pnpm
+        run: npm install -g pnpm@11.20.0
+
+      - name: Install isolated DSH runtime
+        env:
+          DSH_PACKAGE_SPEC: '@deepseek-ai/dsh@next'
+          DSH_RUNTIME_HOME: ${{ runner.temp }}/dsh-runtime
+          DSH_BIN_DIR: ${{ runner.temp }}/bin
+        run: bash Scripts/repair-dsh-runtime.sh
+
+      - name: Verify DSH CLI
+        env:
+          DSH_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          "$DSH_BIN_DIR/dsh" --version
+
+      - name: Boot DSH web and probe HTTP
+        env:
+          DSH_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/dsh-web.log"
+          "$DSH_BIN_DIR/dsh" web --host 127.0.0.1 --port 39081 --no-open >"$LOG" 2>&1 &
+          PID=$!
+          cleanup() {
+            kill "$PID" >/dev/null 2>&1 || true
+            wait "$PID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 180); do
+            if curl -fsS http://127.0.0.1:39081/ >/dev/null; then
+              echo "DSH web smoke test passed"
+              exit 0
+            fi
+            if ! kill -0 "$PID" >/dev/null 2>&1; then
+              echo "DSH exited before becoming ready" >&2
+              cat "$LOG" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "DSH web did not become ready within 180 seconds" >&2
+          cat "$LOG" >&2
+          exit 1

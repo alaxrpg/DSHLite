@@ -1,0 +1,7 @@
+# 本地构建与运行产物
+.build-cache/
+.build/
+dist/
+*.pid
+*.log
+.DS_Store

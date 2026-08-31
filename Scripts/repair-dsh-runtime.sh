@@ -30,6 +30,12 @@ packages:
   - .
 nodeLinker: hoisted
 autoInstallPeers: true
+allowBuilds:
+  '@deepseek-ai/dsh-subprocess-local': true
+  '@google/genai': true
+  koffi: true
+  node-pty: true
+  protobufjs: true
 YAML
 
 pushd "$RUNTIME_HOME" >/dev/null

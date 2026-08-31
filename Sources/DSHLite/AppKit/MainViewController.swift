@@ -10,16 +10,20 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
     private var errorView: NSView?
     private var navigationFailureView: NSView?
 
-    /// 当前加载的 URL（避免重复加载）
+    /// 最近一次交给 WKWebView 加载的后端地址。
+    ///
+    /// 这个值只在目标 URL 真正变化时更新；Loading/Failed 仅隐藏 WebView，
+    /// 不再把它清空。否则后端状态短暂抖动后回到同一个 URL，会被误判成
+    /// “新页面”并再次 load，表现为页面持续刷新。
     private var loadedURL: URL?
 
     init(state: AppState) {
         self.state = state
         super.init(nibName: nil, bundle: nil)
-        // [修复] 用经典 AppKit 主队列派发代替 Swift 并发 Task job：
-        // macOS 27 beta 的进程外菜单栏（MenuBarClientCore）在 Swift 并发 job 上下文中
-        // 提交 UI 变更时存在 use-after-free（swift_task_isCurrentExecutorWithFlagsImpl
-        // 撞已释放 executor），改走 DispatchQueue.main 避开该路径。
+
+        // macOS 27 beta 的进程外菜单栏（MenuBarClientCore）在 Swift 并发 job
+        // 上下文中提交部分 AppKit/WebKit UI 变更存在崩溃路径，因此继续走经典
+        // 主队列派发，不改回 Task { @MainActor }。
         state.addObserver { [weak self] in
             DispatchQueue.main.async {
                 self?.refreshFromState()
@@ -35,9 +39,9 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 1100, height: 720))
         view.wantsLayer = true
         view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        // [修复] WebView 在 AppKit 启动上下文（loadView）中提前创建、隐藏待命：
-        // 避免 READY 时从异步回调上下文首次创建 WKWebView（会注册文本输入上下文、
-        // 牵动进程外菜单栏，在 macOS 27 beta 上触发 MenuBarClientCore 崩溃）。
+
+        // WKWebView 在 AppKit 启动上下文中提前创建并隐藏待命，避免 READY 时
+        // 从异步回调上下文首次创建 WKWebView。
         setupWebView()
     }
 
@@ -49,12 +53,14 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
     // MARK: - 状态刷新
 
     private func refreshFromState() {
-        let phase = state.backendState.phase
-        switch phase {
+        switch state.backendState.phase {
         case .ready:
             showWebView(url: state.backendState.currentURL)
         case .failed:
-            showError(reason: state.backendState.failureReason ?? "未知错误", exitCode: state.backendState.exitCode)
+            showError(
+                reason: state.backendState.failureReason ?? "未知错误",
+                exitCode: state.backendState.exitCode
+            )
         default:
             showLoading(stageText: state.backendState.stageText)
         }
@@ -64,13 +70,16 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
 
     private func showLoading(stageText: String) {
         removeErrorView()
-        removeWebView()
+        removeNavigationFailureView()
+        hideWebView()
+
         if let loadingView {
             if let label = loadingView.viewWithTag(1001) as? NSTextField {
                 label.stringValue = stageText
             }
             return
         }
+
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(container)
@@ -109,27 +118,31 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
             stage.centerXAnchor.constraint(equalTo: container.centerXAnchor),
             stage.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
+
         loadingView = container
     }
 
     /// 启动时创建 WebView（隐藏），约束就位；READY 时再上屏加载。
     private func setupWebView() {
         guard webView == nil else { return }
+
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
 
         let wv = WKWebView(frame: .zero, configuration: configuration)
         wv.navigationDelegate = self
         wv.allowsBackForwardNavigationGestures = true
-        wv.isHidden = true // 等后端 READY 再显示
+        wv.isHidden = true
         wv.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(wv)
+
         NSLayoutConstraint.activate([
             wv.topAnchor.constraint(equalTo: view.topAnchor),
             wv.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             wv.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             wv.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         ])
+
         webView = wv
     }
 
@@ -137,22 +150,29 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
         removeErrorView()
         removeNavigationFailureView()
         removeLoadingView()
+
         guard let url else {
             showLoading(stageText: "等待 URL…")
             return
         }
         guard let webView else { return }
+
         webView.isHidden = false
-        if loadedURL != url {
-            webView.load(URLRequest(url: url))
-            loadedURL = url
-        }
+
+        // 只在 endpoint 真正变化时导航。相同 URL 的状态通知只更新 UI，
+        // 不触发 load/reload。
+        guard loadedURL != url else { return }
+
+        loadedURL = url
+        webView.load(URLRequest(url: url))
     }
 
     private func showError(reason: String, exitCode: Int32?) {
-        removeWebView()
+        hideWebView()
         removeLoadingView()
+        removeNavigationFailureView()
         if errorView != nil { return }
+
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(container)
@@ -208,6 +228,7 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
             title.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 12),
             title.centerXAnchor.constraint(equalTo: container.centerXAnchor)
         ]
+
         var previous: NSView = title
         for control in controls.dropFirst(2) {
             constraints.append(control.topAnchor.constraint(equalTo: previous.bottomAnchor, constant: 10))
@@ -217,15 +238,17 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
             previous = control
         }
         constraints.append(previous.bottomAnchor.constraint(equalTo: container.bottomAnchor))
+
         NSLayoutConstraint.activate(constraints)
         errorView = container
     }
 
-    private func removeWebView() {
-        // [修复] 不销毁 WebView 实例，仅隐藏复用（避免在回调上下文重新创建，
-        // 同时保留 WebKit 进程池，重启后加载更快）
+    /// 只隐藏 WebView，保留实例、进程池以及已加载 endpoint。
+    ///
+    /// 后端重新启动到随机端口时 URL 会变化，READY 后自然触发一次新加载；
+    /// 相同 URL 的状态抖动不会再次加载页面。
+    private func hideWebView() {
         webView?.isHidden = true
-        loadedURL = nil
     }
 
     private func removeLoadingView() {
@@ -266,25 +289,36 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
         reload.bezelStyle = .rounded
         reload.translatesAutoresizingMaskIntoConstraints = false
         overlay.addSubview(reload)
+
         let restart = NSButton(title: "重启 DSH", target: self, action: #selector(restartPressed))
         restart.bezelStyle = .rounded
         restart.translatesAutoresizingMaskIntoConstraints = false
         overlay.addSubview(restart)
+
         let logs = NSButton(title: "查看日志", target: self, action: #selector(logsPressed))
         logs.bezelStyle = .rounded
         logs.translatesAutoresizingMaskIntoConstraints = false
         overlay.addSubview(logs)
 
         NSLayoutConstraint.activate([
-            overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor), overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            overlay.topAnchor.constraint(equalTo: view.topAnchor), overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            title.centerXAnchor.constraint(equalTo: overlay.centerXAnchor), title.centerYAnchor.constraint(equalTo: overlay.centerYAnchor, constant: -55),
-            detail.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 10), detail.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
-            detail.leadingAnchor.constraint(greaterThanOrEqualTo: overlay.leadingAnchor, constant: 24), detail.trailingAnchor.constraint(lessThanOrEqualTo: overlay.trailingAnchor, constant: -24),
-            reload.topAnchor.constraint(equalTo: detail.bottomAnchor, constant: 18), reload.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
-            restart.topAnchor.constraint(equalTo: reload.bottomAnchor, constant: 8), restart.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
-            logs.topAnchor.constraint(equalTo: restart.bottomAnchor, constant: 8), logs.centerXAnchor.constraint(equalTo: overlay.centerXAnchor)
+            overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            overlay.topAnchor.constraint(equalTo: view.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            title.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            title.centerYAnchor.constraint(equalTo: overlay.centerYAnchor, constant: -55),
+            detail.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 10),
+            detail.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            detail.leadingAnchor.constraint(greaterThanOrEqualTo: overlay.leadingAnchor, constant: 24),
+            detail.trailingAnchor.constraint(lessThanOrEqualTo: overlay.trailingAnchor, constant: -24),
+            reload.topAnchor.constraint(equalTo: detail.bottomAnchor, constant: 18),
+            reload.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            restart.topAnchor.constraint(equalTo: reload.bottomAnchor, constant: 8),
+            restart.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            logs.topAnchor.constraint(equalTo: restart.bottomAnchor, constant: 8),
+            logs.centerXAnchor.constraint(equalTo: overlay.centerXAnchor)
         ])
+
         navigationFailureView = overlay
     }
 
@@ -305,7 +339,7 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
 
     @objc private func reloadPagePressed() {
         removeNavigationFailureView()
-        if let webView { webView.reload() }
+        webView?.reload()
     }
 
     // MARK: - WKNavigationDelegate（Navigation Security）
@@ -319,12 +353,16 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
             decisionHandler(.cancel)
             return
         }
-        // 放行 loopback；外部链接交系统浏览器
-        let host = (url.host ?? "").lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+
+        // 放行 loopback；外部链接交系统浏览器。
+        let host = (url.host ?? "")
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         if host == "127.0.0.1" || host == "localhost" || host == "::1" {
             decisionHandler(.allow)
             return
         }
+
         if url.scheme == "http" || url.scheme == "https" {
             NSWorkspace.shared.open(url)
         }
@@ -335,7 +373,11 @@ final class MainViewController: NSViewController, WKNavigationDelegate {
         showNavigationFailure(error)
     }
 
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
         showNavigationFailure(error)
     }
 }

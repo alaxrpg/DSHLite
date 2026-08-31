@@ -15,10 +15,24 @@ BIN="$BUILD/DSHLite.bin"
 APP_DIR="$ROOT/dist/DSH Lite.app"
 CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
+RESOURCES="$CONTENTS/Resources"
+ICON_SOURCE="$ROOT/Assets/DSHFishLogo.svg"
+ICONSET="$BUILD/AppIcon.iconset"
+APP_ICON="$BUILD/AppIcon.icns"
+
+if [ ! -f "$ICON_SOURCE" ]; then
+    echo "错误：缺少官方 DSH FishLogo 源文件 $ICON_SOURCE" >&2
+    exit 2
+fi
 
 echo "==> 清理本项目编译缓存"
-rm -rf "$OBJ" "$BIN"
+rm -rf "$OBJ" "$BIN" "$ICONSET" "$APP_ICON"
 mkdir -p "$OBJ" "$BUILD/modules"
+
+echo "==> 从官方 FishLogo 生成 AppIcon.icns"
+swift "$ROOT/Scripts/generate-app-icon.swift" "$ICON_SOURCE" "$ICONSET"
+iconutil -c icns "$ICONSET" -o "$APP_ICON"
+test -f "$APP_ICON"
 
 echo "==> 编译 DSHLiteCore 源码"
 pushd "$OBJ" >/dev/null
@@ -39,8 +53,9 @@ swiftc -o "$BIN" -module-cache-path "$BUILD/modules" -I "$BUILD" \
 
 echo "==> 组装 .app bundle"
 rm -rf "$APP_DIR"
-mkdir -p "$MACOS" "$CONTENTS/Resources"
+mkdir -p "$MACOS" "$RESOURCES"
 cp "$BIN" "$MACOS/DSH Lite"
+cp "$APP_ICON" "$RESOURCES/AppIcon.icns"
 
 cat > "$CONTENTS/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -54,6 +69,7 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>1.0.0</string>
 <key>CFBundleVersion</key><string>1</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
@@ -65,4 +81,5 @@ codesign --force --deep --sign - "$APP_DIR"
 codesign --verify --deep --strict "$APP_DIR"
 test -x "$MACOS/DSH Lite"
 test -f "$CONTENTS/Info.plist"
+test -f "$RESOURCES/AppIcon.icns"
 echo "==> 完成: $APP_DIR"
